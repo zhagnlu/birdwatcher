@@ -16,6 +16,7 @@ import (
 	"github.com/milvus-io/birdwatcher/models"
 	"github.com/milvus-io/birdwatcher/states/etcd/common"
 	"github.com/milvus-io/birdwatcher/states/ossutil"
+	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 )
 
 // JSONStatsParam defines parameters for `show json-stats` command.
@@ -50,6 +51,31 @@ func (c *ComponentShow) JSONStatsCommand(ctx context.Context, p *JSONStatsParam)
 		return nil
 	}
 
+	// collect unique collection IDs and build a map of collectionID -> JSON field IDs
+	collectionIDs := make(map[int64]struct{})
+	for _, seg := range segments {
+		collectionIDs[seg.CollectionID] = struct{}{}
+	}
+
+	// collectionJSONFields: collectionID -> set of JSON field IDs
+	collectionJSONFields := make(map[int64]map[int64]struct{})
+	for collID := range collectionIDs {
+		coll, err := common.GetCollectionByIDVersion(ctx, c.client, c.metaPath, collID)
+		if err != nil {
+			fmt.Printf("warning: failed to get collection %d schema: %v\n", collID, err)
+			continue
+		}
+		jsonFields := make(map[int64]struct{})
+		for _, field := range coll.GetProto().GetSchema().GetFields() {
+			if field.DataType == schemapb.DataType_JSON {
+				jsonFields[field.FieldID] = struct{}{}
+			}
+		}
+		if len(jsonFields) > 0 {
+			collectionJSONFields[collID] = jsonFields
+		}
+	}
+
 	total := 0
 	built := 0
 	var notBuiltSegIDs []int64
@@ -62,7 +88,22 @@ func (c *ComponentShow) JSONStatsCommand(ctx context.Context, p *JSONStatsParam)
 	)
 
 	for _, seg := range segments {
-		// only segments matching the high-level filters are considered
+		// check if this segment needs json stats (collection has JSON fields)
+		jsonFields, hasJSONFields := collectionJSONFields[seg.CollectionID]
+		if !hasJSONFields {
+			// collection has no JSON fields, skip this segment
+			continue
+		}
+
+		// if p.FieldID is specified, check if it's a JSON field in this collection
+		if p.FieldID != 0 {
+			if _, isJSONField := jsonFields[p.FieldID]; !isJSONField {
+				// specified field is not a JSON field in this collection, skip
+				continue
+			}
+		}
+
+		// this segment needs json stats
 		total++
 
 		// determine built status according to field filter
