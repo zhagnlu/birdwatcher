@@ -25,8 +25,6 @@ type LoadedJSONStatsParam struct {
 
 // LoadedJsonStatsCommand returns show loaded-json-stats command.
 func (c *ComponentShow) LoadedJSONStatsCommand(ctx context.Context, p *LoadedJSONStatsParam) error {
-	// Build expected segment set from etcd meta using the same filters
-	expected := make(map[int64]struct{})
 	segments, err := common.ListSegments(ctx, c.client, c.metaPath, func(seg *models.Segment) bool {
 		if p.CollectionID != 0 && p.CollectionID != seg.CollectionID {
 			return false
@@ -40,28 +38,56 @@ func (c *ComponentShow) LoadedJSONStatsCommand(ctx context.Context, p *LoadedJSO
 			return false
 		}
 
-		if !p.IncludeUnBuilt {
-			// If a specific field is provided, expect segments that have JsonKeyStats for that field
-			if p.FieldID != 0 {
-				if seg.JsonKeyStats == nil {
-					return false
-				}
-				if _, ok := seg.JsonKeyStats[p.FieldID]; !ok {
-					return false
-				}
-			} else if len(seg.JsonKeyStats) == 0 {
-				// otherwise, expect segments that have any json stats configured in meta
-				return false
-			}
-		}
-
 		return true
 	})
 	if err != nil {
 		return err
 	}
 
+	collectionIDs := make(map[int64]struct{})
+	if p.CollectionID != 0 {
+		collectionIDs[p.CollectionID] = struct{}{}
+	}
 	for _, seg := range segments {
+		collectionIDs[seg.CollectionID] = struct{}{}
+	}
+	collectionJSONFields := c.collectionJSONFields(ctx, collectionIDs)
+
+	// Build expected segment set from etcd meta using the same JSON field filters as show json-stats.
+	expected := make(map[int64]struct{})
+	for _, seg := range segments {
+		jsonFields, ok := collectionJSONFields[seg.CollectionID]
+		if !ok {
+			continue
+		}
+		if p.FieldID != 0 {
+			if _, ok := jsonFields[p.FieldID]; !ok {
+				continue
+			}
+		}
+
+		if !p.IncludeUnBuilt {
+			if p.FieldID != 0 {
+				if seg.JsonKeyStats == nil {
+					continue
+				}
+				if _, ok := seg.JsonKeyStats[p.FieldID]; !ok {
+					continue
+				}
+			} else {
+				hasJSONStats := false
+				for fieldID := range seg.JsonKeyStats {
+					if _, ok := jsonFields[fieldID]; ok {
+						hasJSONStats = true
+						break
+					}
+				}
+				if !hasJSONStats {
+					continue
+				}
+			}
+		}
+
 		expected[seg.ID] = struct{}{}
 	}
 
@@ -115,16 +141,32 @@ func (c *ComponentShow) LoadedJSONStatsCommand(ctx context.Context, p *LoadedJSO
 			if p.SegmentID != 0 && p.SegmentID != segment.GetID() {
 				continue
 			}
+			jsonFields, ok := collectionJSONFields[segment.GetCollection()]
+			if !ok {
+				continue
+			}
+			if p.FieldID != 0 {
+				if _, ok := jsonFields[p.FieldID]; !ok {
+					continue
+				}
+			}
 
-			fmt.Printf("  collection %d, segment %d:\n", segment.GetCollection(), segment.GetID())
 			jsonStats := segment.GetJsonStatsInfo()
 			if len(jsonStats) == 0 {
 				continue
 			}
 			loadedThisSeg := false
+			printedHeader := false
 			for fieldId, jsonStat := range jsonStats {
 				if p.FieldID != 0 && p.FieldID != fieldId {
 					continue
+				}
+				if _, ok := jsonFields[fieldId]; !ok {
+					continue
+				}
+				if !printedHeader {
+					fmt.Printf("  collection %d, segment %d:\n", segment.GetCollection(), segment.GetID())
+					printedHeader = true
 				}
 				fmt.Printf("    field [%d]: index stats: %s\n", fieldId, jsonStat)
 				loadedThisSeg = true

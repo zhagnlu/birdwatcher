@@ -57,24 +57,7 @@ func (c *ComponentShow) JSONStatsCommand(ctx context.Context, p *JSONStatsParam)
 		collectionIDs[seg.CollectionID] = struct{}{}
 	}
 
-	// collectionJSONFields: collectionID -> set of JSON field IDs
-	collectionJSONFields := make(map[int64]map[int64]struct{})
-	for collID := range collectionIDs {
-		coll, err := common.GetCollectionByIDVersion(ctx, c.client, c.metaPath, collID)
-		if err != nil {
-			fmt.Printf("warning: failed to get collection %d schema: %v\n", collID, err)
-			continue
-		}
-		jsonFields := make(map[int64]struct{})
-		for _, field := range coll.GetProto().GetSchema().GetFields() {
-			if field.DataType == schemapb.DataType_JSON {
-				jsonFields[field.FieldID] = struct{}{}
-			}
-		}
-		if len(jsonFields) > 0 {
-			collectionJSONFields[collID] = jsonFields
-		}
-	}
+	collectionJSONFields := c.collectionJSONFields(ctx, collectionIDs)
 
 	total := 0
 	built := 0
@@ -205,6 +188,27 @@ func (c *ComponentShow) JSONStatsCommand(ctx context.Context, p *JSONStatsParam)
 	}
 
 	return nil
+}
+
+func (c *ComponentShow) collectionJSONFields(ctx context.Context, collectionIDs map[int64]struct{}) map[int64]map[int64]struct{} {
+	collectionJSONFields := make(map[int64]map[int64]struct{})
+	for collID := range collectionIDs {
+		coll, err := common.GetCollectionByIDVersion(ctx, c.client, c.metaPath, collID)
+		if err != nil {
+			fmt.Printf("warning: failed to get collection %d schema: %v\n", collID, err)
+			continue
+		}
+		jsonFields := make(map[int64]struct{})
+		for _, field := range coll.GetProto().GetSchema().GetFields() {
+			if field.DataType == schemapb.DataType_JSON {
+				jsonFields[field.FieldID] = struct{}{}
+			}
+		}
+		if len(jsonFields) > 0 {
+			collectionJSONFields[collID] = jsonFields
+		}
+	}
+	return collectionJSONFields
 }
 
 // readParquetFooterSummary reads last 8 bytes of parquet to show metadata length and magic
