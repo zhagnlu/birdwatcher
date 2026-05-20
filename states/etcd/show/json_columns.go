@@ -49,10 +49,13 @@ type JSONColumnStat struct {
 }
 
 type JSONColumns struct {
-	columns            []*JSONColumnStat
-	matchedCollections int
-	segmentCount       int
-	segmentRows        int64
+	columns             []*JSONColumnStat
+	matchedCollections  int
+	segmentCount        int
+	segmentRows         int64
+	totalLogSizeBytes   int64
+	totalMemoryBytes    int64
+	totalJSONStatsBytes int64
 }
 
 // JSONColumnsCommand returns show json-columns command.
@@ -163,11 +166,17 @@ func (c *ComponentShow) JSONColumnsCommand(ctx context.Context, p *JSONColumnsPa
 	}
 
 	columns := make([]*JSONColumnStat, 0)
+	var totalLogSizeBytes int64
+	var totalMemoryBytes int64
+	var totalJSONStatsBytes int64
 	for _, fieldStats := range stats {
 		for _, stat := range fieldStats {
 			stat.LogSize = hrSize(stat.LogSizeBytes)
 			stat.MemorySize = hrSize(stat.MemorySizeBytes)
 			stat.JSONStatsMemory = hrSize(stat.JSONStatsMemoryBytes)
+			totalLogSizeBytes += stat.LogSizeBytes
+			totalMemoryBytes += stat.MemorySizeBytes
+			totalJSONStatsBytes += stat.JSONStatsMemoryBytes
 			columns = append(columns, stat)
 		}
 	}
@@ -185,10 +194,13 @@ func (c *ComponentShow) JSONColumnsCommand(ctx context.Context, p *JSONColumnsPa
 	})
 
 	return framework.NewPresetResultSet(&JSONColumns{
-		columns:            columns,
-		matchedCollections: matchedCollections,
-		segmentCount:       len(segments),
-		segmentRows:        segmentRows,
+		columns:             columns,
+		matchedCollections:  matchedCollections,
+		segmentCount:        len(segments),
+		segmentRows:         segmentRows,
+		totalLogSizeBytes:   totalLogSizeBytes,
+		totalMemoryBytes:    totalMemoryBytes,
+		totalJSONStatsBytes: totalJSONStatsBytes,
 	}, framework.NameFormat(p.Format)), nil
 }
 
@@ -235,8 +247,9 @@ func (rs *JSONColumns) printAsTable() string {
 			fmt.Sprintf("%d/%d, %s", col.JSONStatsBuiltSegments, col.SegmentCount, col.JSONStatsMemory),
 		})
 	}
-	return fmt.Sprintf("%s\n--- JSON collections: %d, JSON columns: %d, matched segments: %d, matched rows: %d\n",
-		t.Render(), rs.matchedCollections, len(rs.columns), rs.segmentCount, rs.segmentRows)
+	return fmt.Sprintf("%s\n--- JSON collections: %d collections, JSON columns: %d columns, matched segments: %d segments, matched rows: %d rows, insert log size: %s, mem size: %s, json stats size: %s\n",
+		t.Render(), rs.matchedCollections, len(rs.columns), rs.segmentCount, rs.segmentRows,
+		hrSize(rs.totalLogSizeBytes), hrSize(rs.totalMemoryBytes), hrSize(rs.totalJSONStatsBytes))
 }
 
 func (rs *JSONColumns) printAsLine() string {
@@ -245,25 +258,38 @@ func (rs *JSONColumns) printAsLine() string {
 		fmt.Fprintf(sb, "collection %s(%d) field %s(%d) rows %d size %s\n",
 			col.CollectionName, col.CollectionID, col.FieldName, col.FieldID, col.RowCount, col.LogSize)
 	}
-	fmt.Fprintf(sb, "--- JSON collections: %d, JSON columns: %d, matched segments: %d, matched rows: %d\n",
-		rs.matchedCollections, len(rs.columns), rs.segmentCount, rs.segmentRows)
+	fmt.Fprintf(sb, "--- JSON collections: %d collections, JSON columns: %d columns, matched segments: %d segments, matched rows: %d rows, insert log size: %s, mem size: %s, json stats size: %s\n",
+		rs.matchedCollections, len(rs.columns), rs.segmentCount, rs.segmentRows,
+		hrSize(rs.totalLogSizeBytes), hrSize(rs.totalMemoryBytes), hrSize(rs.totalJSONStatsBytes))
 	return sb.String()
 }
 
 func (rs *JSONColumns) printAsJSON() string {
 	type OutputJSON struct {
-		Columns            []*JSONColumnStat `json:"columns"`
-		JSONCollections    int               `json:"json_collections"`
-		JSONColumns        int               `json:"json_columns"`
-		MatchedSegmentRows int64             `json:"matched_segment_rows"`
-		MatchedSegments    int               `json:"matched_segments"`
+		Columns             []*JSONColumnStat `json:"columns"`
+		JSONCollections     int               `json:"json_collections"`
+		JSONColumns         int               `json:"json_columns"`
+		MatchedSegmentRows  int64             `json:"matched_segment_rows"`
+		MatchedSegments     int               `json:"matched_segments"`
+		TotalLogSizeBytes   int64             `json:"total_log_size_bytes"`
+		TotalLogSize        string            `json:"total_log_size"`
+		TotalMemoryBytes    int64             `json:"total_memory_bytes"`
+		TotalMemory         string            `json:"total_memory"`
+		TotalJSONStatsBytes int64             `json:"total_json_stats_bytes"`
+		TotalJSONStats      string            `json:"total_json_stats"`
 	}
 
 	return framework.MarshalJSON(OutputJSON{
-		Columns:            rs.columns,
-		JSONCollections:    rs.matchedCollections,
-		JSONColumns:        len(rs.columns),
-		MatchedSegmentRows: rs.segmentRows,
-		MatchedSegments:    rs.segmentCount,
+		Columns:             rs.columns,
+		JSONCollections:     rs.matchedCollections,
+		JSONColumns:         len(rs.columns),
+		MatchedSegmentRows:  rs.segmentRows,
+		MatchedSegments:     rs.segmentCount,
+		TotalLogSizeBytes:   rs.totalLogSizeBytes,
+		TotalLogSize:        hrSize(rs.totalLogSizeBytes),
+		TotalMemoryBytes:    rs.totalMemoryBytes,
+		TotalMemory:         hrSize(rs.totalMemoryBytes),
+		TotalJSONStatsBytes: rs.totalJSONStatsBytes,
+		TotalJSONStats:      hrSize(rs.totalJSONStatsBytes),
 	})
 }
