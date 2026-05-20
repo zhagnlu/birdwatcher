@@ -17,6 +17,7 @@ import (
 	"github.com/milvus-io/birdwatcher/states/etcd/common"
 	"github.com/milvus-io/birdwatcher/states/ossutil"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
 )
 
 // JSONStatsParam defines parameters for `show json-stats` command.
@@ -39,6 +40,7 @@ func (c *ComponentShow) JSONStatsCommand(ctx context.Context, p *JSONStatsParam)
 		return (p.CollectionID == 0 || segment.CollectionID == p.CollectionID) &&
 			(p.PartitionID == 0 || segment.PartitionID == p.PartitionID) &&
 			(p.SegmentID == 0 || segment.ID == p.SegmentID) &&
+			segment.Level != datapb.SegmentLevel_L0 &&
 			(p.State == "" || strings.EqualFold(segment.State.String(), p.State))
 	})
 	if err != nil {

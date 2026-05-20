@@ -12,6 +12,7 @@ import (
 	"github.com/milvus-io/birdwatcher/models"
 	"github.com/milvus-io/birdwatcher/states/etcd/common"
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
 )
 
@@ -30,6 +31,9 @@ func (c *ComponentShow) LoadedJSONStatsCommand(ctx context.Context, p *LoadedJSO
 			return false
 		}
 		if p.SegmentID != 0 && p.SegmentID != seg.ID {
+			return false
+		}
+		if seg.Level == datapb.SegmentLevel_L0 {
 			return false
 		}
 
