@@ -58,6 +58,13 @@ type JSONColumns struct {
 	totalJSONStatsBytes int64
 }
 
+type insertLogSummary struct {
+	logCount        int
+	rowCount        int64
+	logSizeBytes    int64
+	memorySizeBytes int64
+}
+
 // JSONColumnsCommand returns show json-columns command.
 func (c *ComponentShow) JSONColumnsCommand(ctx context.Context, p *JSONColumnsParam) (*framework.PresetResultSet, error) {
 	dbNames := make(map[int64]string)
@@ -141,17 +148,39 @@ func (c *ComponentShow) JSONColumnsCommand(ctx context.Context, p *JSONColumnsPa
 			stat.SegmentRows += seg.GetNumOfRows()
 		}
 
+		var segmentInsertLogs insertLogSummary
+		exactFieldIDs := make(map[int64]struct{})
+		packedChildStats := make(map[int64]*JSONColumnStat)
+
 		for _, fieldBinlog := range seg.GetBinlogs() {
-			stat, ok := fieldStats[fieldBinlog.FieldID]
-			if !ok {
+			if fieldBinlog == nil {
 				continue
 			}
-			stat.LogCount += len(fieldBinlog.Binlogs)
-			for _, binlog := range fieldBinlog.Binlogs {
-				stat.RowCount += binlog.EntriesNum
-				stat.LogSizeBytes += binlog.LogSize
-				stat.MemorySizeBytes += binlog.MemSize
+			summary := summarizeFieldBinlog(fieldBinlog)
+
+			segmentInsertLogs.logCount += summary.logCount
+			segmentInsertLogs.logSizeBytes += summary.logSizeBytes
+			segmentInsertLogs.memorySizeBytes += summary.memorySizeBytes
+
+			if stat, ok := fieldStats[fieldBinlog.FieldID]; ok {
+				stat.LogCount += summary.logCount
+				stat.RowCount += summary.rowCount
+				stat.LogSizeBytes += summary.logSizeBytes
+				stat.MemorySizeBytes += summary.memorySizeBytes
+				exactFieldIDs[fieldBinlog.FieldID] = struct{}{}
 			}
+
+			collectPackedChildJSONColumnStats(fieldStats, fieldBinlog, exactFieldIDs, packedChildStats)
+		}
+
+		for fieldID, stat := range packedChildStats {
+			if _, ok := exactFieldIDs[fieldID]; ok {
+				continue
+			}
+			stat.LogCount += segmentInsertLogs.logCount
+			stat.RowCount += seg.GetNumOfRows()
+			stat.LogSizeBytes += segmentInsertLogs.logSizeBytes
+			stat.MemorySizeBytes += segmentInsertLogs.memorySizeBytes
 		}
 
 		for fieldID, keyStats := range seg.GetJsonKeyStats() {
@@ -202,6 +231,40 @@ func (c *ComponentShow) JSONColumnsCommand(ctx context.Context, p *JSONColumnsPa
 		totalMemoryBytes:    totalMemoryBytes,
 		totalJSONStatsBytes: totalJSONStatsBytes,
 	}, framework.NameFormat(p.Format)), nil
+}
+
+func summarizeFieldBinlog(fieldBinlog *models.FieldBinlog) insertLogSummary {
+	if fieldBinlog == nil {
+		return insertLogSummary{}
+	}
+
+	summary := insertLogSummary{logCount: len(fieldBinlog.Binlogs)}
+	for _, binlog := range fieldBinlog.Binlogs {
+		summary.rowCount += binlog.EntriesNum
+		summary.logSizeBytes += binlog.LogSize
+		summary.memorySizeBytes += binlog.MemSize
+	}
+	return summary
+}
+
+func collectPackedChildJSONColumnStats(
+	fieldStats map[int64]*JSONColumnStat,
+	fieldBinlog *models.FieldBinlog,
+	exactFieldIDs map[int64]struct{},
+	packedChildStats map[int64]*JSONColumnStat,
+) {
+	if fieldBinlog == nil {
+		return
+	}
+
+	for _, childFieldID := range fieldBinlog.ChildFields {
+		if _, ok := exactFieldIDs[childFieldID]; ok {
+			continue
+		}
+		if stat, ok := fieldStats[childFieldID]; ok {
+			packedChildStats[childFieldID] = stat
+		}
+	}
 }
 
 func (rs *JSONColumns) Entities() any {
