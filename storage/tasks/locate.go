@@ -1,6 +1,7 @@
 package tasks
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 
@@ -21,7 +22,7 @@ func (t *LocateTask) Scan(pk common.PrimaryKey, batchInfo *common.BatchInfo, off
 	}
 	fmt.Printf("entry found, segment %d offset %d, pk: %v, ts: %v\n", batchInfo.SegmentID, offset, pk.GetValue(), values[1])
 	for fieldID, value := range values {
-		fmt.Printf("field %d: %v\n", fieldID, value)
+		fmt.Printf("field %d: %v\n", fieldID, formatLocateValue(value))
 	}
 	fmt.Printf("binlog batch %d, pk binlog %s\n", batchInfo.BatchIdx, batchInfo.TargetBinlogs[t.pkField.FieldID])
 
@@ -29,6 +30,14 @@ func (t *LocateTask) Scan(pk common.PrimaryKey, batchInfo *common.BatchInfo, off
 }
 
 func (t *LocateTask) Summary() {}
+
+func formatLocateValue(value any) any {
+	bytes, ok := value.([]byte)
+	if !ok || !json.Valid(bytes) {
+		return value
+	}
+	return fmt.Sprintf("%s (json size: %d bytes)", string(bytes), len(bytes))
+}
 
 func NewLocateTask(limit int64, pkField models.FieldSchema) *LocateTask {
 	return &LocateTask{

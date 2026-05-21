@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/jedib0t/go-pretty/v6/table"
@@ -26,31 +27,34 @@ type JSONColumnsParam struct {
 }
 
 type JSONColumnStat struct {
-	DatabaseID             int64  `json:"database_id"`
-	DatabaseName           string `json:"database_name,omitempty"`
-	CollectionID           int64  `json:"collection_id"`
-	CollectionName         string `json:"collection_name"`
-	CollectionState        string `json:"collection_state"`
-	FieldID                int64  `json:"field_id"`
-	FieldName              string `json:"field_name"`
-	IsDynamic              bool   `json:"is_dynamic,omitempty"`
-	SegmentCount           int    `json:"segment_count"`
-	SegmentRows            int64  `json:"segment_rows"`
-	RowCount               int64  `json:"row_count"`
-	LogCount               int    `json:"log_count"`
-	LogSizeBytes           int64  `json:"log_size_bytes"`
-	LogSize                string `json:"log_size"`
-	MemorySizeBytes        int64  `json:"memory_size_bytes"`
-	MemorySize             string `json:"memory_size"`
-	JSONStatsBuiltSegments int    `json:"json_stats_built_segments"`
-	JSONStatsFileCount     int    `json:"json_stats_file_count"`
-	JSONStatsMemoryBytes   int64  `json:"json_stats_memory_bytes"`
-	JSONStatsMemory        string `json:"json_stats_memory"`
+	DatabaseID             int64    `json:"database_id"`
+	DatabaseName           string   `json:"database_name,omitempty"`
+	CollectionID           int64    `json:"collection_id"`
+	CollectionName         string   `json:"collection_name"`
+	CollectionState        string   `json:"collection_state"`
+	FieldID                int64    `json:"field_id"`
+	FieldName              string   `json:"field_name"`
+	FieldIDs               []int64  `json:"field_ids,omitempty"`
+	FieldNames             []string `json:"field_names,omitempty"`
+	IsDynamic              bool     `json:"is_dynamic,omitempty"`
+	SegmentCount           int      `json:"segment_count"`
+	SegmentRows            int64    `json:"segment_rows"`
+	RowCount               int64    `json:"row_count"`
+	LogCount               int      `json:"log_count"`
+	LogSizeBytes           int64    `json:"log_size_bytes"`
+	LogSize                string   `json:"log_size"`
+	MemorySizeBytes        int64    `json:"memory_size_bytes"`
+	MemorySize             string   `json:"memory_size"`
+	JSONStatsBuiltSegments int      `json:"json_stats_built_segments"`
+	JSONStatsFileCount     int      `json:"json_stats_file_count"`
+	JSONStatsMemoryBytes   int64    `json:"json_stats_memory_bytes"`
+	JSONStatsMemory        string   `json:"json_stats_memory"`
 }
 
 type JSONColumns struct {
 	columns             []*JSONColumnStat
 	matchedCollections  int
+	jsonColumnCount     int
 	segmentCount        int
 	segmentRows         int64
 	totalLogSizeBytes   int64
@@ -63,6 +67,16 @@ type insertLogSummary struct {
 	rowCount        int64
 	logSizeBytes    int64
 	memorySizeBytes int64
+}
+
+type jsonCollectionStats struct {
+	databaseID      int64
+	databaseName    string
+	collectionID    int64
+	collectionName  string
+	collectionState string
+	fields          map[int64]*schemapb.FieldSchema
+	groups          map[string]*JSONColumnStat
 }
 
 // JSONColumnsCommand returns show json-columns command.
@@ -85,9 +99,10 @@ func (c *ComponentShow) JSONColumnsCommand(ctx context.Context, p *JSONColumnsPa
 		return nil, err
 	}
 
-	stats := make(map[int64]map[int64]*JSONColumnStat)
+	stats := make(map[int64]*jsonCollectionStats)
 	collectionIDs := make(map[int64]struct{})
 	matchedCollections := 0
+	jsonColumnCount := 0
 	for _, collection := range collections {
 		coll := collection.GetProto()
 		var jsonFields []*schemapb.FieldSchema
@@ -101,22 +116,19 @@ func (c *ComponentShow) JSONColumnsCommand(ctx context.Context, p *JSONColumnsPa
 		}
 
 		matchedCollections++
+		jsonColumnCount += len(jsonFields)
 		collectionIDs[coll.GetID()] = struct{}{}
-		stats[coll.GetID()] = make(map[int64]*JSONColumnStat)
+		stats[coll.GetID()] = &jsonCollectionStats{
+			databaseID:      coll.GetDbId(),
+			databaseName:    dbNames[coll.GetDbId()],
+			collectionID:    coll.GetID(),
+			collectionName:  coll.GetSchema().GetName(),
+			collectionState: coll.GetState().String(),
+			fields:          make(map[int64]*schemapb.FieldSchema),
+			groups:          make(map[string]*JSONColumnStat),
+		}
 		for _, field := range jsonFields {
-			stats[coll.GetID()][field.GetFieldID()] = &JSONColumnStat{
-				DatabaseID:      coll.GetDbId(),
-				DatabaseName:    dbNames[coll.GetDbId()],
-				CollectionID:    coll.GetID(),
-				CollectionName:  coll.GetSchema().GetName(),
-				CollectionState: coll.GetState().String(),
-				FieldID:         field.GetFieldID(),
-				FieldName:       field.GetName(),
-				IsDynamic:       field.GetIsDynamic(),
-				LogSize:         hrSize(0),
-				MemorySize:      hrSize(0),
-				JSONStatsMemory: hrSize(0),
-			}
+			stats[coll.GetID()].fields[field.GetFieldID()] = field
 		}
 	}
 
@@ -141,52 +153,89 @@ func (c *ComponentShow) JSONColumnsCommand(ctx context.Context, p *JSONColumnsPa
 
 	var segmentRows int64
 	for _, seg := range segments {
-		fieldStats := stats[seg.GetCollectionID()]
-		segmentRows += seg.GetNumOfRows()
-		for _, stat := range fieldStats {
-			stat.SegmentCount++
-			stat.SegmentRows += seg.GetNumOfRows()
+		collectionStats := stats[seg.GetCollectionID()]
+		if collectionStats == nil {
+			continue
 		}
+		segmentRows += seg.GetNumOfRows()
 
 		exactFieldIDs := make(map[int64]struct{})
-		packedChildSummaries := make(map[int64]insertLogSummary)
+		for _, fieldBinlog := range seg.GetBinlogs() {
+			if fieldBinlog == nil {
+				continue
+			}
+			if _, ok := collectionStats.fields[fieldBinlog.FieldID]; ok {
+				exactFieldIDs[fieldBinlog.FieldID] = struct{}{}
+			}
+		}
 
+		segmentGroups := make(map[string]insertLogSummary)
+		segmentGroupFields := make(map[string][]int64)
+		fieldGroupKeys := make(map[int64]string)
 		for _, fieldBinlog := range seg.GetBinlogs() {
 			if fieldBinlog == nil {
 				continue
 			}
 			summary := summarizeFieldBinlog(fieldBinlog)
 
-			if stat, ok := fieldStats[fieldBinlog.FieldID]; ok {
-				stat.LogCount += summary.logCount
-				stat.RowCount += summary.rowCount
-				stat.LogSizeBytes += summary.logSizeBytes
-				stat.MemorySizeBytes += summary.memorySizeBytes
-				exactFieldIDs[fieldBinlog.FieldID] = struct{}{}
+			if _, ok := collectionStats.fields[fieldBinlog.FieldID]; ok {
+				fieldIDs := []int64{fieldBinlog.FieldID}
+				key := jsonFieldGroupKey(fieldIDs)
+				groupSummary := segmentGroups[key]
+				mergeInsertLogSummary(&groupSummary, summary)
+				segmentGroups[key] = groupSummary
+				segmentGroupFields[key] = fieldIDs
+				fieldGroupKeys[fieldBinlog.FieldID] = key
 			}
 
-			collectPackedChildJSONColumnStats(fieldStats, fieldBinlog, exactFieldIDs, summary, packedChildSummaries)
-		}
-
-		for fieldID, summary := range packedChildSummaries {
-			if _, ok := exactFieldIDs[fieldID]; ok {
+			childFieldIDs := packedJSONChildFieldIDs(collectionStats.fields, fieldBinlog.ChildFields, exactFieldIDs)
+			if len(childFieldIDs) == 0 {
 				continue
 			}
-			stat := fieldStats[fieldID]
+			key := jsonFieldGroupKey(childFieldIDs)
+			groupSummary := segmentGroups[key]
+			mergeInsertLogSummary(&groupSummary, summary)
+			segmentGroups[key] = groupSummary
+			segmentGroupFields[key] = childFieldIDs
+			for _, fieldID := range childFieldIDs {
+				fieldGroupKeys[fieldID] = key
+			}
+		}
+
+		for key, summary := range segmentGroups {
+			stat := ensureJSONGroupStat(collectionStats, segmentGroupFields[key])
+			stat.SegmentCount++
+			stat.SegmentRows += seg.GetNumOfRows()
 			stat.LogCount += summary.logCount
 			stat.RowCount += summary.rowCount
 			stat.LogSizeBytes += summary.logSizeBytes
 			stat.MemorySizeBytes += summary.memorySizeBytes
 		}
 
+		type jsonStatsSummary struct {
+			fileCount   int
+			memoryBytes int64
+		}
+		segmentJSONStats := make(map[string]jsonStatsSummary)
 		for fieldID, keyStats := range seg.GetJsonKeyStats() {
-			stat, ok := fieldStats[fieldID]
-			if !ok {
+			if _, ok := collectionStats.fields[fieldID]; !ok {
 				continue
 			}
+			key, ok := fieldGroupKeys[fieldID]
+			if !ok {
+				key = jsonFieldGroupKey([]int64{fieldID})
+				segmentGroupFields[key] = []int64{fieldID}
+			}
+			summary := segmentJSONStats[key]
+			summary.fileCount += len(keyStats.GetFiles())
+			summary.memoryBytes += keyStats.GetMemorySize()
+			segmentJSONStats[key] = summary
+		}
+		for key, summary := range segmentJSONStats {
+			stat := ensureJSONGroupStat(collectionStats, segmentGroupFields[key])
 			stat.JSONStatsBuiltSegments++
-			stat.JSONStatsFileCount += len(keyStats.GetFiles())
-			stat.JSONStatsMemoryBytes += keyStats.GetMemorySize()
+			stat.JSONStatsFileCount += summary.fileCount
+			stat.JSONStatsMemoryBytes += summary.memoryBytes
 		}
 	}
 
@@ -194,8 +243,9 @@ func (c *ComponentShow) JSONColumnsCommand(ctx context.Context, p *JSONColumnsPa
 	var totalLogSizeBytes int64
 	var totalMemoryBytes int64
 	var totalJSONStatsBytes int64
-	for _, fieldStats := range stats {
-		for _, stat := range fieldStats {
+	for _, collectionStats := range stats {
+		ensureMissingJSONFieldRows(collectionStats)
+		for _, stat := range collectionStats.groups {
 			stat.LogSize = hrSize(stat.LogSizeBytes)
 			stat.MemorySize = hrSize(stat.MemorySizeBytes)
 			stat.JSONStatsMemory = hrSize(stat.JSONStatsMemoryBytes)
@@ -221,6 +271,7 @@ func (c *ComponentShow) JSONColumnsCommand(ctx context.Context, p *JSONColumnsPa
 	return framework.NewPresetResultSet(&JSONColumns{
 		columns:             columns,
 		matchedCollections:  matchedCollections,
+		jsonColumnCount:     jsonColumnCount,
 		segmentCount:        len(segments),
 		segmentRows:         segmentRows,
 		totalLogSizeBytes:   totalLogSizeBytes,
@@ -243,30 +294,114 @@ func summarizeFieldBinlog(fieldBinlog *models.FieldBinlog) insertLogSummary {
 	return summary
 }
 
-func collectPackedChildJSONColumnStats(
-	fieldStats map[int64]*JSONColumnStat,
-	fieldBinlog *models.FieldBinlog,
-	exactFieldIDs map[int64]struct{},
-	summary insertLogSummary,
-	packedChildSummaries map[int64]insertLogSummary,
-) {
-	if fieldBinlog == nil {
-		return
+func mergeInsertLogSummary(dst *insertLogSummary, src insertLogSummary) {
+	dst.logCount += src.logCount
+	dst.rowCount += src.rowCount
+	dst.logSizeBytes += src.logSizeBytes
+	dst.memorySizeBytes += src.memorySizeBytes
+}
+
+func ensureJSONGroupStat(collectionStats *jsonCollectionStats, fieldIDs []int64) *JSONColumnStat {
+	fieldIDs = normalizeJSONFieldIDs(fieldIDs)
+	key := jsonFieldGroupKey(fieldIDs)
+	if stat, ok := collectionStats.groups[key]; ok {
+		return stat
 	}
 
-	for _, childFieldID := range fieldBinlog.ChildFields {
+	fieldNames := make([]string, 0, len(fieldIDs))
+	isDynamic := false
+	for _, fieldID := range fieldIDs {
+		field := collectionStats.fields[fieldID]
+		if field == nil {
+			continue
+		}
+		fieldNames = append(fieldNames, field.GetName())
+		isDynamic = isDynamic || field.GetIsDynamic()
+	}
+
+	stat := &JSONColumnStat{
+		DatabaseID:      collectionStats.databaseID,
+		DatabaseName:    collectionStats.databaseName,
+		CollectionID:    collectionStats.collectionID,
+		CollectionName:  collectionStats.collectionName,
+		CollectionState: collectionStats.collectionState,
+		FieldIDs:        append([]int64(nil), fieldIDs...),
+		FieldNames:      fieldNames,
+		IsDynamic:       isDynamic,
+		LogSize:         hrSize(0),
+		MemorySize:      hrSize(0),
+		JSONStatsMemory: hrSize(0),
+	}
+	if len(fieldIDs) > 0 {
+		stat.FieldID = fieldIDs[0]
+	}
+	if len(fieldNames) > 0 {
+		stat.FieldName = fieldNames[0]
+	}
+
+	collectionStats.groups[key] = stat
+	return stat
+}
+
+func ensureMissingJSONFieldRows(collectionStats *jsonCollectionStats) {
+	represented := make(map[int64]struct{})
+	for _, stat := range collectionStats.groups {
+		for _, fieldID := range stat.FieldIDs {
+			represented[fieldID] = struct{}{}
+		}
+	}
+
+	for fieldID := range collectionStats.fields {
+		if _, ok := represented[fieldID]; ok {
+			continue
+		}
+		ensureJSONGroupStat(collectionStats, []int64{fieldID})
+	}
+}
+
+func packedJSONChildFieldIDs(
+	jsonFields map[int64]*schemapb.FieldSchema,
+	childFields []int64,
+	exactFieldIDs map[int64]struct{},
+) []int64 {
+	fieldIDs := make([]int64, 0, len(childFields))
+	for _, childFieldID := range childFields {
 		if _, ok := exactFieldIDs[childFieldID]; ok {
 			continue
 		}
-		if _, ok := fieldStats[childFieldID]; ok {
-			childSummary := packedChildSummaries[childFieldID]
-			childSummary.logCount += summary.logCount
-			childSummary.rowCount += summary.rowCount
-			childSummary.logSizeBytes += summary.logSizeBytes
-			childSummary.memorySizeBytes += summary.memorySizeBytes
-			packedChildSummaries[childFieldID] = childSummary
+		if _, ok := jsonFields[childFieldID]; ok {
+			fieldIDs = append(fieldIDs, childFieldID)
 		}
 	}
+	return normalizeJSONFieldIDs(fieldIDs)
+}
+
+func normalizeJSONFieldIDs(fieldIDs []int64) []int64 {
+	if len(fieldIDs) == 0 {
+		return nil
+	}
+	result := append([]int64(nil), fieldIDs...)
+	sort.Slice(result, func(i, j int) bool {
+		return result[i] < result[j]
+	})
+	n := 0
+	for _, fieldID := range result {
+		if n > 0 && result[n-1] == fieldID {
+			continue
+		}
+		result[n] = fieldID
+		n++
+	}
+	return result[:n]
+}
+
+func jsonFieldGroupKey(fieldIDs []int64) string {
+	fieldIDs = normalizeJSONFieldIDs(fieldIDs)
+	parts := make([]string, 0, len(fieldIDs))
+	for _, fieldID := range fieldIDs {
+		parts = append(parts, strconv.FormatInt(fieldID, 10))
+	}
+	return strings.Join(parts, ",")
 }
 
 func (rs *JSONColumns) Entities() any {
@@ -302,8 +437,8 @@ func (rs *JSONColumns) printAsTable() string {
 			dbName,
 			col.CollectionName,
 			col.CollectionID,
-			col.FieldName,
-			col.FieldID,
+			displayJSONFieldNames(col),
+			displayJSONFieldIDs(col),
 			col.SegmentCount,
 			col.RowCount,
 			col.LogSize,
@@ -312,21 +447,39 @@ func (rs *JSONColumns) printAsTable() string {
 			fmt.Sprintf("%d/%d, %s", col.JSONStatsBuiltSegments, col.SegmentCount, col.JSONStatsMemory),
 		})
 	}
-	return fmt.Sprintf("%s\n--- JSON collections: %d collections, JSON columns: %d columns, matched segments: %d segments, matched rows: %d rows, insert log size: %s, mem size: %s, json stats size: %s\n",
-		t.Render(), rs.matchedCollections, len(rs.columns), rs.segmentCount, rs.segmentRows,
+	return fmt.Sprintf("%s\n--- JSON collections: %d collections, JSON columns: %d columns, storage groups: %d groups, matched segments: %d segments, matched rows: %d rows, insert log size: %s, mem size: %s, json stats size: %s\n",
+		t.Render(), rs.matchedCollections, rs.jsonColumnCount, len(rs.columns), rs.segmentCount, rs.segmentRows,
 		hrSize(rs.totalLogSizeBytes), hrSize(rs.totalMemoryBytes), hrSize(rs.totalJSONStatsBytes))
 }
 
 func (rs *JSONColumns) printAsLine() string {
 	sb := &strings.Builder{}
 	for _, col := range rs.columns {
-		fmt.Fprintf(sb, "collection %s(%d) field %s(%d) rows %d size %s\n",
-			col.CollectionName, col.CollectionID, col.FieldName, col.FieldID, col.RowCount, col.LogSize)
+		fmt.Fprintf(sb, "collection %s(%d) fields %s(%s) rows %d size %s\n",
+			col.CollectionName, col.CollectionID, displayJSONFieldNames(col), displayJSONFieldIDs(col), col.RowCount, col.LogSize)
 	}
-	fmt.Fprintf(sb, "--- JSON collections: %d collections, JSON columns: %d columns, matched segments: %d segments, matched rows: %d rows, insert log size: %s, mem size: %s, json stats size: %s\n",
-		rs.matchedCollections, len(rs.columns), rs.segmentCount, rs.segmentRows,
+	fmt.Fprintf(sb, "--- JSON collections: %d collections, JSON columns: %d columns, storage groups: %d groups, matched segments: %d segments, matched rows: %d rows, insert log size: %s, mem size: %s, json stats size: %s\n",
+		rs.matchedCollections, rs.jsonColumnCount, len(rs.columns), rs.segmentCount, rs.segmentRows,
 		hrSize(rs.totalLogSizeBytes), hrSize(rs.totalMemoryBytes), hrSize(rs.totalJSONStatsBytes))
 	return sb.String()
+}
+
+func displayJSONFieldNames(col *JSONColumnStat) string {
+	if len(col.FieldNames) == 0 {
+		return col.FieldName
+	}
+	return strings.Join(col.FieldNames, ",")
+}
+
+func displayJSONFieldIDs(col *JSONColumnStat) string {
+	if len(col.FieldIDs) == 0 {
+		return strconv.FormatInt(col.FieldID, 10)
+	}
+	parts := make([]string, 0, len(col.FieldIDs))
+	for _, fieldID := range col.FieldIDs {
+		parts = append(parts, strconv.FormatInt(fieldID, 10))
+	}
+	return strings.Join(parts, ",")
 }
 
 func (rs *JSONColumns) printAsJSON() string {
@@ -334,6 +487,7 @@ func (rs *JSONColumns) printAsJSON() string {
 		Columns             []*JSONColumnStat `json:"columns"`
 		JSONCollections     int               `json:"json_collections"`
 		JSONColumns         int               `json:"json_columns"`
+		StorageGroups       int               `json:"storage_groups"`
 		MatchedSegmentRows  int64             `json:"matched_segment_rows"`
 		MatchedSegments     int               `json:"matched_segments"`
 		TotalLogSizeBytes   int64             `json:"total_log_size_bytes"`
@@ -347,7 +501,8 @@ func (rs *JSONColumns) printAsJSON() string {
 	return framework.MarshalJSON(OutputJSON{
 		Columns:             rs.columns,
 		JSONCollections:     rs.matchedCollections,
-		JSONColumns:         len(rs.columns),
+		JSONColumns:         rs.jsonColumnCount,
+		StorageGroups:       len(rs.columns),
 		MatchedSegmentRows:  rs.segmentRows,
 		MatchedSegments:     rs.segmentCount,
 		TotalLogSizeBytes:   rs.totalLogSizeBytes,
