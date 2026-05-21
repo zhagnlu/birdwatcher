@@ -148,19 +148,14 @@ func (c *ComponentShow) JSONColumnsCommand(ctx context.Context, p *JSONColumnsPa
 			stat.SegmentRows += seg.GetNumOfRows()
 		}
 
-		var segmentInsertLogs insertLogSummary
 		exactFieldIDs := make(map[int64]struct{})
-		packedChildStats := make(map[int64]*JSONColumnStat)
+		packedChildSummaries := make(map[int64]insertLogSummary)
 
 		for _, fieldBinlog := range seg.GetBinlogs() {
 			if fieldBinlog == nil {
 				continue
 			}
 			summary := summarizeFieldBinlog(fieldBinlog)
-
-			segmentInsertLogs.logCount += summary.logCount
-			segmentInsertLogs.logSizeBytes += summary.logSizeBytes
-			segmentInsertLogs.memorySizeBytes += summary.memorySizeBytes
 
 			if stat, ok := fieldStats[fieldBinlog.FieldID]; ok {
 				stat.LogCount += summary.logCount
@@ -170,17 +165,18 @@ func (c *ComponentShow) JSONColumnsCommand(ctx context.Context, p *JSONColumnsPa
 				exactFieldIDs[fieldBinlog.FieldID] = struct{}{}
 			}
 
-			collectPackedChildJSONColumnStats(fieldStats, fieldBinlog, exactFieldIDs, packedChildStats)
+			collectPackedChildJSONColumnStats(fieldStats, fieldBinlog, exactFieldIDs, summary, packedChildSummaries)
 		}
 
-		for fieldID, stat := range packedChildStats {
+		for fieldID, summary := range packedChildSummaries {
 			if _, ok := exactFieldIDs[fieldID]; ok {
 				continue
 			}
-			stat.LogCount += segmentInsertLogs.logCount
-			stat.RowCount += seg.GetNumOfRows()
-			stat.LogSizeBytes += segmentInsertLogs.logSizeBytes
-			stat.MemorySizeBytes += segmentInsertLogs.memorySizeBytes
+			stat := fieldStats[fieldID]
+			stat.LogCount += summary.logCount
+			stat.RowCount += summary.rowCount
+			stat.LogSizeBytes += summary.logSizeBytes
+			stat.MemorySizeBytes += summary.memorySizeBytes
 		}
 
 		for fieldID, keyStats := range seg.GetJsonKeyStats() {
@@ -251,7 +247,8 @@ func collectPackedChildJSONColumnStats(
 	fieldStats map[int64]*JSONColumnStat,
 	fieldBinlog *models.FieldBinlog,
 	exactFieldIDs map[int64]struct{},
-	packedChildStats map[int64]*JSONColumnStat,
+	summary insertLogSummary,
+	packedChildSummaries map[int64]insertLogSummary,
 ) {
 	if fieldBinlog == nil {
 		return
@@ -261,8 +258,13 @@ func collectPackedChildJSONColumnStats(
 		if _, ok := exactFieldIDs[childFieldID]; ok {
 			continue
 		}
-		if stat, ok := fieldStats[childFieldID]; ok {
-			packedChildStats[childFieldID] = stat
+		if _, ok := fieldStats[childFieldID]; ok {
+			childSummary := packedChildSummaries[childFieldID]
+			childSummary.logCount += summary.logCount
+			childSummary.rowCount += summary.rowCount
+			childSummary.logSizeBytes += summary.logSizeBytes
+			childSummary.memorySizeBytes += summary.memorySizeBytes
+			packedChildSummaries[childFieldID] = childSummary
 		}
 	}
 }
