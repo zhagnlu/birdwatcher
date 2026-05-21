@@ -194,12 +194,23 @@ func (c *ComponentShow) JSONStatsCommand(ctx context.Context, p *JSONStatsParam)
 
 func (c *ComponentShow) collectionJSONFields(ctx context.Context, collectionIDs map[int64]struct{}) map[int64]map[int64]struct{} {
 	collectionJSONFields := make(map[int64]map[int64]struct{})
-	for collID := range collectionIDs {
-		coll, err := common.GetCollectionByIDVersion(ctx, c.client, c.metaPath, collID)
-		if err != nil {
-			fmt.Printf("warning: failed to get collection %d schema: %v\n", collID, err)
-			continue
-		}
+	if len(collectionIDs) == 0 {
+		return collectionJSONFields
+	}
+
+	collections, err := common.ListCollections(ctx, c.client, c.metaPath, func(coll *models.Collection) bool {
+		_, ok := collectionIDs[coll.GetProto().GetID()]
+		return ok
+	})
+	if err != nil {
+		fmt.Printf("warning: failed to list collection schemas: %v\n", err)
+		return collectionJSONFields
+	}
+
+	found := make(map[int64]struct{}, len(collections))
+	for _, coll := range collections {
+		collID := coll.GetProto().GetID()
+		found[collID] = struct{}{}
 		jsonFields := make(map[int64]struct{})
 		for _, field := range coll.GetProto().GetSchema().GetFields() {
 			if field.DataType == schemapb.DataType_JSON {
@@ -208,6 +219,11 @@ func (c *ComponentShow) collectionJSONFields(ctx context.Context, collectionIDs 
 		}
 		if len(jsonFields) > 0 {
 			collectionJSONFields[collID] = jsonFields
+		}
+	}
+	for collID := range collectionIDs {
+		if _, ok := found[collID]; !ok {
+			fmt.Printf("warning: failed to get collection %d schema: collection not found\n", collID)
 		}
 	}
 	return collectionJSONFields
