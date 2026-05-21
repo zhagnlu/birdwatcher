@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -52,12 +53,18 @@ func (s *InstanceState) ScanBinlogCommand(ctx context.Context, p *ScanBinlogPara
 	}
 	fmt.Printf("PK Field [%d] %s\n", pkField.FieldID, pkField.Name)
 
-	fieldsMap := make(map[string]struct{})
+	fieldNames := make(map[string]struct{})
+	fieldIDs := make(map[int64]struct{})
 	for _, field := range p.Fields {
-		fieldsMap[field] = struct{}{}
+		if fieldID, err := strconv.ParseInt(field, 10, 64); err == nil {
+			fieldIDs[fieldID] = struct{}{}
+			continue
+		}
+		fieldNames[field] = struct{}{}
 	}
 
 	fields := make(map[int64]*schemapb.FieldSchema)
+	matchedFields := make(map[string]struct{})
 
 	for _, fieldSchema := range collection.GetProto().Schema.Fields {
 		// timestamp field id
@@ -70,9 +77,22 @@ func (s *InstanceState) ScanBinlogCommand(ctx context.Context, p *ScanBinlogPara
 			fields[fieldSchema.FieldID] = fieldSchema
 			continue
 		}
-		if _, ok := fieldsMap[fieldSchema.Name]; ok {
+		_, nameMatched := fieldNames[fieldSchema.Name]
+		_, idMatched := fieldIDs[fieldSchema.FieldID]
+		if nameMatched || idMatched {
 			fmt.Printf("Output Field %s field id %d\n", fieldSchema.Name, fieldSchema.FieldID)
 			fields[fieldSchema.FieldID] = fieldSchema
+			if nameMatched {
+				matchedFields[fieldSchema.Name] = struct{}{}
+			}
+			if idMatched {
+				matchedFields[strconv.FormatInt(fieldSchema.FieldID, 10)] = struct{}{}
+			}
+		}
+	}
+	for _, field := range p.Fields {
+		if _, ok := matchedFields[field]; !ok {
+			return errors.Newf("field %q not found in collection schema; use field name or field id", field)
 		}
 	}
 
