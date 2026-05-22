@@ -2,16 +2,23 @@ package show
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/jedib0t/go-pretty/v6/table"
+	"github.com/minio/minio-go/v7"
 
 	"github.com/milvus-io/birdwatcher/framework"
 	"github.com/milvus-io/birdwatcher/models"
 	"github.com/milvus-io/birdwatcher/states/etcd/common"
+	"github.com/milvus-io/birdwatcher/states/ossutil"
+	"github.com/milvus-io/birdwatcher/storage"
+	storagecommon "github.com/milvus-io/birdwatcher/storage/common"
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 )
@@ -24,31 +31,52 @@ type JSONColumnsParam struct {
 	CollectionState        string `name:"collection-state" default:"" desc:"collection state to filter"`
 	SegmentState           string `name:"segment-state" default:"" desc:"segment state to include; empty means all non-dropped segments"`
 	IncludeDropped         bool   `name:"include-dropped" default:"false" desc:"include dropped segments in data size statistics"`
+	V2SampleRows           int64  `name:"v2-sample-rows" default:"0" desc:"sample rows for v2 JSON storage groups to estimate per-field sizes"`
 }
 
 type JSONColumnStat struct {
-	DatabaseID             int64    `json:"database_id"`
-	DatabaseName           string   `json:"database_name,omitempty"`
-	CollectionID           int64    `json:"collection_id"`
-	CollectionName         string   `json:"collection_name"`
-	CollectionState        string   `json:"collection_state"`
-	FieldID                int64    `json:"field_id"`
-	FieldName              string   `json:"field_name"`
-	FieldIDs               []int64  `json:"field_ids,omitempty"`
-	FieldNames             []string `json:"field_names,omitempty"`
-	IsDynamic              bool     `json:"is_dynamic,omitempty"`
-	SegmentCount           int      `json:"segment_count"`
-	SegmentRows            int64    `json:"segment_rows"`
-	RowCount               int64    `json:"row_count"`
-	LogCount               int      `json:"log_count"`
-	LogSizeBytes           int64    `json:"log_size_bytes"`
-	LogSize                string   `json:"log_size"`
-	MemorySizeBytes        int64    `json:"memory_size_bytes"`
-	MemorySize             string   `json:"memory_size"`
-	JSONStatsBuiltSegments int      `json:"json_stats_built_segments"`
-	JSONStatsFileCount     int      `json:"json_stats_file_count"`
-	JSONStatsMemoryBytes   int64    `json:"json_stats_memory_bytes"`
-	JSONStatsMemory        string   `json:"json_stats_memory"`
+	DatabaseID             int64                        `json:"database_id"`
+	DatabaseName           string                       `json:"database_name,omitempty"`
+	CollectionID           int64                        `json:"collection_id"`
+	CollectionName         string                       `json:"collection_name"`
+	CollectionState        string                       `json:"collection_state"`
+	FieldID                int64                        `json:"field_id"`
+	FieldName              string                       `json:"field_name"`
+	FieldIDs               []int64                      `json:"field_ids,omitempty"`
+	FieldNames             []string                     `json:"field_names,omitempty"`
+	StorageMode            string                       `json:"storage_mode"`
+	SizeScope              string                       `json:"size_scope"`
+	IsDynamic              bool                         `json:"is_dynamic,omitempty"`
+	SegmentCount           int                          `json:"segment_count"`
+	SegmentRows            int64                        `json:"segment_rows"`
+	RowCount               int64                        `json:"row_count"`
+	LogCount               int                          `json:"log_count"`
+	LogSizeBytes           int64                        `json:"log_size_bytes"`
+	LogSize                string                       `json:"log_size"`
+	MemorySizeBytes        int64                        `json:"memory_size_bytes"`
+	MemorySize             string                       `json:"memory_size"`
+	JSONStatsBuiltSegments int                          `json:"json_stats_built_segments"`
+	JSONStatsFileCount     int                          `json:"json_stats_file_count"`
+	JSONStatsMemoryBytes   int64                        `json:"json_stats_memory_bytes"`
+	JSONStatsMemory        string                       `json:"json_stats_memory"`
+	V2SampleRows           int64                        `json:"v2_sample_rows,omitempty"`
+	V2SampleBytes          int64                        `json:"v2_sample_bytes,omitempty"`
+	V2FieldEstimates       []*JSONColumnV2FieldEstimate `json:"v2_field_estimates,omitempty"`
+}
+
+type JSONColumnV2FieldEstimate struct {
+	FieldID                  int64   `json:"field_id"`
+	FieldName                string  `json:"field_name,omitempty"`
+	SampleRows               int64   `json:"sample_rows"`
+	SampleBytes              int64   `json:"sample_bytes"`
+	SampleAvgBytes           float64 `json:"sample_avg_bytes"`
+	RawEstimateBytes         int64   `json:"raw_estimate_bytes"`
+	RawEstimate              string  `json:"raw_estimate"`
+	SampleRatio              float64 `json:"sample_ratio"`
+	EstimatedLogSizeBytes    int64   `json:"estimated_log_size_bytes"`
+	EstimatedLogSize         string  `json:"estimated_log_size"`
+	EstimatedMemorySizeBytes int64   `json:"estimated_memory_size_bytes"`
+	EstimatedMemorySize      string  `json:"estimated_memory_size"`
 }
 
 type JSONColumns struct {
@@ -239,12 +267,20 @@ func (c *ComponentShow) JSONColumnsCommand(ctx context.Context, p *JSONColumnsPa
 		}
 	}
 
+	for _, collectionStats := range stats {
+		ensureMissingJSONFieldRows(collectionStats)
+	}
+	if p.V2SampleRows > 0 {
+		if err := c.fillV2JSONColumnEstimates(ctx, p.V2SampleRows, stats, segments); err != nil {
+			return nil, err
+		}
+	}
+
 	columns := make([]*JSONColumnStat, 0)
 	var totalLogSizeBytes int64
 	var totalMemoryBytes int64
 	var totalJSONStatsBytes int64
 	for _, collectionStats := range stats {
-		ensureMissingJSONFieldRows(collectionStats)
 		for _, stat := range collectionStats.groups {
 			stat.LogSize = hrSize(stat.LogSizeBytes)
 			stat.MemorySize = hrSize(stat.MemorySizeBytes)
@@ -327,6 +363,8 @@ func ensureJSONGroupStat(collectionStats *jsonCollectionStats, fieldIDs []int64)
 		CollectionState: collectionStats.collectionState,
 		FieldIDs:        append([]int64(nil), fieldIDs...),
 		FieldNames:      fieldNames,
+		StorageMode:     jsonStorageMode(fieldIDs),
+		SizeScope:       jsonSizeScope(fieldIDs),
 		IsDynamic:       isDynamic,
 		LogSize:         hrSize(0),
 		MemorySize:      hrSize(0),
@@ -425,27 +463,44 @@ func (rs *JSONColumns) printAsTable() string {
 	}
 
 	t := table.NewWriter()
-	t.AppendHeader(table.Row{
-		"DB", "Collection", "CollectionID", "Field", "FieldID", "Segments", "Rows", "InsertLog", "Mem", "Logs", "JsonStats",
-	})
+	showV2Estimates := false
+	for _, col := range rs.columns {
+		if len(col.V2FieldEstimates) > 0 {
+			showV2Estimates = true
+			break
+		}
+	}
+	header := table.Row{
+		"DB", "Collection", "CollectionID", "Field", "FieldID", "Mode", "Scope", "Segments", "Rows", "InsertLog", "Mem", "Logs", "JsonStats",
+	}
+	if showV2Estimates {
+		header = append(header, "V2Estimate")
+	}
+	t.AppendHeader(header)
 	for _, col := range rs.columns {
 		dbName := col.DatabaseName
 		if dbName == "" {
 			dbName = fmt.Sprintf("%d", col.DatabaseID)
 		}
-		t.AppendRow(table.Row{
+		row := table.Row{
 			dbName,
 			col.CollectionName,
 			col.CollectionID,
 			displayJSONFieldNames(col),
 			displayJSONFieldIDs(col),
+			col.StorageMode,
+			col.SizeScope,
 			col.SegmentCount,
 			col.RowCount,
 			col.LogSize,
 			col.MemorySize,
 			col.LogCount,
 			fmt.Sprintf("%d/%d, %s", col.JSONStatsBuiltSegments, col.SegmentCount, col.JSONStatsMemory),
-		})
+		}
+		if showV2Estimates {
+			row = append(row, displayV2Estimates(col))
+		}
+		t.AppendRow(row)
 	}
 	return fmt.Sprintf("%s\n--- JSON collections: %d collections, JSON columns: %d columns, storage groups: %d groups, matched segments: %d segments, matched rows: %d rows, insert log size: %s, mem size: %s, json stats size: %s\n",
 		t.Render(), rs.matchedCollections, rs.jsonColumnCount, len(rs.columns), rs.segmentCount, rs.segmentRows,
@@ -455,8 +510,12 @@ func (rs *JSONColumns) printAsTable() string {
 func (rs *JSONColumns) printAsLine() string {
 	sb := &strings.Builder{}
 	for _, col := range rs.columns {
-		fmt.Fprintf(sb, "collection %s(%d) fields %s(%s) rows %d size %s\n",
-			col.CollectionName, col.CollectionID, displayJSONFieldNames(col), displayJSONFieldIDs(col), col.RowCount, col.LogSize)
+		fmt.Fprintf(sb, "collection %s(%d) fields %s(%s) mode %s scope %s rows %d size %s",
+			col.CollectionName, col.CollectionID, displayJSONFieldNames(col), displayJSONFieldIDs(col), col.StorageMode, col.SizeScope, col.RowCount, col.LogSize)
+		if len(col.V2FieldEstimates) > 0 {
+			fmt.Fprintf(sb, " v2 estimates %s", displayV2Estimates(col))
+		}
+		fmt.Fprintln(sb)
 	}
 	fmt.Fprintf(sb, "--- JSON collections: %d collections, JSON columns: %d columns, storage groups: %d groups, matched segments: %d segments, matched rows: %d rows, insert log size: %s, mem size: %s, json stats size: %s\n",
 		rs.matchedCollections, rs.jsonColumnCount, len(rs.columns), rs.segmentCount, rs.segmentRows,
@@ -480,6 +539,261 @@ func displayJSONFieldIDs(col *JSONColumnStat) string {
 		parts = append(parts, strconv.FormatInt(fieldID, 10))
 	}
 	return strings.Join(parts, ",")
+}
+
+func jsonStorageMode(fieldIDs []int64) string {
+	if len(fieldIDs) > 1 {
+		return "v2"
+	}
+	return "v1"
+}
+
+func jsonSizeScope(fieldIDs []int64) string {
+	if len(fieldIDs) > 1 {
+		return "shared_group"
+	}
+	return "field"
+}
+
+type v2JSONSample struct {
+	rows       int64
+	totalBytes int64
+	fieldBytes map[int64]int64
+}
+
+func (c *ComponentShow) fillV2JSONColumnEstimates(
+	ctx context.Context,
+	sampleRows int64,
+	stats map[int64]*jsonCollectionStats,
+	segments []*models.Segment,
+) error {
+	hasV2Group := false
+	for _, collectionStats := range stats {
+		for _, stat := range collectionStats.groups {
+			if stat.StorageMode == "v2" {
+				hasV2Group = true
+				break
+			}
+		}
+		if hasV2Group {
+			break
+		}
+	}
+	if !hasV2Group {
+		return nil
+	}
+
+	minioClient, bucketName, rootPath, err := ossutil.GetMinioClientFromCfg(ctx, c.client, c.metaPath)
+	if err != nil {
+		return err
+	}
+	translator := func(binlogPath string) (storagecommon.ReadSeeker, error) {
+		logPath := strings.ReplaceAll(binlogPath, "ROOT_PATH", rootPath)
+		return minioClient.GetObject(ctx, bucketName, logPath, minio.GetObjectOptions{})
+	}
+
+	for _, collectionStats := range stats {
+		groupStats := make([]*JSONColumnStat, 0, len(collectionStats.groups))
+		for _, stat := range collectionStats.groups {
+			if stat.StorageMode == "v2" {
+				groupStats = append(groupStats, stat)
+			}
+		}
+		sort.Slice(groupStats, func(i, j int) bool {
+			return groupStats[i].FieldID < groupStats[j].FieldID
+		})
+		for _, stat := range groupStats {
+			sample, err := sampleV2JSONColumnGroup(ctx, sampleRows, collectionStats, stat, segments, translator)
+			if err != nil {
+				return err
+			}
+			applyV2JSONSample(stat, collectionStats, sample)
+		}
+	}
+	return nil
+}
+
+func sampleV2JSONColumnGroup(
+	ctx context.Context,
+	sampleRows int64,
+	collectionStats *jsonCollectionStats,
+	stat *JSONColumnStat,
+	segments []*models.Segment,
+	translator func(binlog string) (storagecommon.ReadSeeker, error),
+) (*v2JSONSample, error) {
+	sample := &v2JSONSample{
+		fieldBytes: make(map[int64]int64, len(stat.FieldIDs)),
+	}
+	if sampleRows <= 0 || len(stat.FieldIDs) == 0 {
+		return sample, nil
+	}
+
+	targetSegments := make([]*models.Segment, 0)
+	for _, segment := range segments {
+		if segment.GetCollectionID() != collectionStats.collectionID {
+			continue
+		}
+		if !segmentContainsPackedJSONFields(segment, collectionStats.fields, stat.FieldIDs) {
+			continue
+		}
+		targetSegments = append(targetSegments, segment)
+	}
+	sort.Slice(targetSegments, func(i, j int) bool {
+		return targetSegments[i].GetID() < targetSegments[j].GetID()
+	})
+
+	for _, segment := range targetSegments {
+		if sample.rows >= sampleRows {
+			break
+		}
+		if err := sampleV2JSONSegment(ctx, sampleRows, segment, stat.FieldIDs, translator, sample); err != nil {
+			return nil, err
+		}
+	}
+	return sample, nil
+}
+
+func sampleV2JSONSegment(
+	ctx context.Context,
+	sampleRows int64,
+	segment *models.Segment,
+	fieldIDs []int64,
+	translator func(binlog string) (storagecommon.ReadSeeker, error),
+	sample *v2JSONSample,
+) error {
+	reader, err := storage.NewSegmentReader(segment, fieldIDs, translator)
+	if err != nil {
+		return err
+	}
+	defer reader.Close()
+
+	for sample.rows < sampleRows {
+		recordBatch, _, err := reader.Next(ctx)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
+		}
+		rows := recordBatch.Len()
+		for i := 0; i < rows && sample.rows < sampleRows; i++ {
+			var rowBytes int64
+			for _, fieldID := range fieldIDs {
+				arr := recordBatch.Column(fieldID)
+				if arr == nil {
+					return fmt.Errorf("field %d not found in segment %d sample batch", fieldID, segment.GetID())
+				}
+				value, ok := storage.DeserializeItem(arr, schemapb.DataType_JSON, i)
+				if !ok {
+					return fmt.Errorf("failed to deserialize field %d in segment %d sample batch", fieldID, segment.GetID())
+				}
+				size := jsonValueSize(value)
+				sample.fieldBytes[fieldID] += size
+				rowBytes += size
+			}
+			sample.totalBytes += rowBytes
+			sample.rows++
+		}
+	}
+	return nil
+}
+
+func segmentContainsPackedJSONFields(
+	segment *models.Segment,
+	jsonFields map[int64]*schemapb.FieldSchema,
+	fieldIDs []int64,
+) bool {
+	exactFieldIDs := make(map[int64]struct{})
+	for _, fieldBinlog := range segment.GetBinlogs() {
+		if fieldBinlog == nil {
+			continue
+		}
+		if _, ok := jsonFields[fieldBinlog.FieldID]; ok {
+			exactFieldIDs[fieldBinlog.FieldID] = struct{}{}
+		}
+	}
+
+	targetKey := jsonFieldGroupKey(fieldIDs)
+	for _, fieldBinlog := range segment.GetBinlogs() {
+		if fieldBinlog == nil {
+			continue
+		}
+		childFieldIDs := packedJSONChildFieldIDs(jsonFields, fieldBinlog.ChildFields, exactFieldIDs)
+		if jsonFieldGroupKey(childFieldIDs) == targetKey {
+			return true
+		}
+	}
+	return false
+}
+
+func applyV2JSONSample(stat *JSONColumnStat, collectionStats *jsonCollectionStats, sample *v2JSONSample) {
+	if sample == nil || sample.rows == 0 {
+		return
+	}
+	stat.V2SampleRows = sample.rows
+	stat.V2SampleBytes = sample.totalBytes
+	stat.V2FieldEstimates = make([]*JSONColumnV2FieldEstimate, 0, len(stat.FieldIDs))
+	for _, fieldID := range stat.FieldIDs {
+		sampleBytes := sample.fieldBytes[fieldID]
+		avgBytes := float64(sampleBytes) / float64(sample.rows)
+		rawEstimateBytes := int64(math.Round(avgBytes * float64(stat.RowCount)))
+		var ratio float64
+		if sample.totalBytes > 0 {
+			ratio = float64(sampleBytes) / float64(sample.totalBytes)
+		}
+		estimatedLogBytes := int64(math.Round(float64(stat.LogSizeBytes) * ratio))
+		estimatedMemoryBytes := int64(math.Round(float64(stat.MemorySizeBytes) * ratio))
+
+		fieldName := ""
+		if field := collectionStats.fields[fieldID]; field != nil {
+			fieldName = field.GetName()
+		}
+		stat.V2FieldEstimates = append(stat.V2FieldEstimates, &JSONColumnV2FieldEstimate{
+			FieldID:                  fieldID,
+			FieldName:                fieldName,
+			SampleRows:               sample.rows,
+			SampleBytes:              sampleBytes,
+			SampleAvgBytes:           avgBytes,
+			RawEstimateBytes:         rawEstimateBytes,
+			RawEstimate:              hrSize(rawEstimateBytes),
+			SampleRatio:              ratio,
+			EstimatedLogSizeBytes:    estimatedLogBytes,
+			EstimatedLogSize:         hrSize(estimatedLogBytes),
+			EstimatedMemorySizeBytes: estimatedMemoryBytes,
+			EstimatedMemorySize:      hrSize(estimatedMemoryBytes),
+		})
+	}
+}
+
+func jsonValueSize(value any) int64 {
+	switch v := value.(type) {
+	case nil:
+		return 0
+	case []byte:
+		return int64(len(v))
+	case string:
+		return int64(len(v))
+	default:
+		return 0
+	}
+}
+
+func displayV2Estimates(col *JSONColumnStat) string {
+	if len(col.V2FieldEstimates) == 0 {
+		return "-"
+	}
+	parts := make([]string, 0, len(col.V2FieldEstimates))
+	for _, estimate := range col.V2FieldEstimates {
+		parts = append(parts, fmt.Sprintf("%d avg=%.1fB raw~%s ratio=%.2f%% log~%s mem~%s",
+			estimate.FieldID,
+			estimate.SampleAvgBytes,
+			estimate.RawEstimate,
+			estimate.SampleRatio*100,
+			estimate.EstimatedLogSize,
+			estimate.EstimatedMemorySize,
+		))
+	}
+	return fmt.Sprintf("rows=%d; %s", col.V2SampleRows, strings.Join(parts, "; "))
 }
 
 func (rs *JSONColumns) printAsJSON() string {
