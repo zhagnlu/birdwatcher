@@ -111,7 +111,7 @@ func TestPackedJSONChildFieldIDsSkipsExactFields(t *testing.T) {
 	}
 }
 
-func TestApplyV2JSONSampleEstimatesRawAndAllocatedSizes(t *testing.T) {
+func TestApplyV2JSONSampleEstimatesRawAndDirectSizes(t *testing.T) {
 	collectionStats := &jsonCollectionStats{
 		fields: map[int64]*schemapb.FieldSchema{
 			105: {FieldID: 105, Name: "json_a", DataType: schemapb.DataType_JSON},
@@ -154,19 +154,60 @@ func TestApplyV2JSONSampleEstimatesRawAndAllocatedSizes(t *testing.T) {
 	if first.RawEstimateBytes != 2500 {
 		t.Fatalf("raw estimate = %d, want 2500", first.RawEstimateBytes)
 	}
-	if first.EstimatedLogSizeBytes != 250 || first.EstimatedMemorySizeBytes != 500 {
-		t.Fatalf("allocated sizes = log %d mem %d, want 250/500", first.EstimatedLogSizeBytes, first.EstimatedMemorySizeBytes)
+	if first.EstimatedLogSizeBytes != 2500 || first.EstimatedMemorySizeBytes != 2500 {
+		t.Fatalf("direct sample sizes = log %d mem %d, want 2500/2500", first.EstimatedLogSizeBytes, first.EstimatedMemorySizeBytes)
 	}
 
 	second := stat.V2FieldEstimates[1]
 	if second.RawEstimateBytes != 7500 {
 		t.Fatalf("second raw estimate = %d, want 7500", second.RawEstimateBytes)
 	}
-	if second.EstimatedLogSizeBytes != 750 || second.EstimatedMemorySizeBytes != 1500 {
-		t.Fatalf("second allocated sizes = log %d mem %d, want 750/1500", second.EstimatedLogSizeBytes, second.EstimatedMemorySizeBytes)
+	if second.EstimatedLogSizeBytes != 7500 || second.EstimatedMemorySizeBytes != 7500 {
+		t.Fatalf("second direct sample sizes = log %d mem %d, want 7500/7500", second.EstimatedLogSizeBytes, second.EstimatedMemorySizeBytes)
 	}
 
 	if got := displayV2Estimates(stat); !strings.Contains(got, "rows=10 raw_total~9.765625 KB;") {
 		t.Fatalf("displayV2Estimates() = %q, want raw_total summary", got)
+	}
+}
+
+func TestJSONColumnsSummaryIncludesTotalV2RawEstimate(t *testing.T) {
+	rs := &JSONColumns{
+		columns: []*JSONColumnStat{
+			{
+				DatabaseName:           "default",
+				CollectionName:         "posts",
+				FieldName:              "$meta",
+				FieldID:                112,
+				StorageMode:            "v2",
+				SizeScope:              "shared_group",
+				LogSize:                "0.000000 Bytes",
+				MemorySize:             "0.000000 Bytes",
+				JSONStatsMemory:        "0.000000 Bytes",
+				V2RawEstimateBytes:     2048,
+				V2FieldEstimates:       []*JSONColumnV2FieldEstimate{{FieldID: 112, SampleAvgBytes: 2, RawEstimate: "2.000000 KB", EstimatedLogSize: "2.000000 KB", EstimatedMemorySize: "2.000000 KB"}},
+				JSONStatsBuiltSegments: 0,
+			},
+		},
+		matchedCollections:  1,
+		jsonColumnCount:     1,
+		segmentCount:        1,
+		totalV2RawBytes:     2048,
+		totalJSONStatsBytes: 0,
+	}
+
+	line := rs.printAsLine()
+	if !strings.Contains(line, "v2 json estimate size: 2.000000 KB") {
+		t.Fatalf("printAsLine() = %q, want v2 json estimate summary", line)
+	}
+
+	table := rs.printAsTable()
+	if !strings.Contains(table, "v2 json estimate size: 2.000000 KB") {
+		t.Fatalf("printAsTable() = %q, want v2 json estimate summary", table)
+	}
+
+	json := rs.printAsJSON()
+	if !strings.Contains(json, `"total_v2_raw_estimate": "2.000000 KB"`) {
+		t.Fatalf("printAsJSON() = %q, want total_v2_raw_estimate", json)
 	}
 }

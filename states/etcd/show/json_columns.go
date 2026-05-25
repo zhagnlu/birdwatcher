@@ -90,6 +90,7 @@ type JSONColumns struct {
 	totalLogSizeBytes   int64
 	totalMemoryBytes    int64
 	totalJSONStatsBytes int64
+	totalV2RawBytes     int64
 }
 
 type insertLogSummary struct {
@@ -285,6 +286,7 @@ func (c *ComponentShow) JSONColumnsCommand(ctx context.Context, p *JSONColumnsPa
 	var totalLogSizeBytes int64
 	var totalMemoryBytes int64
 	var totalJSONStatsBytes int64
+	var totalV2RawBytes int64
 	for _, collectionStats := range stats {
 		for _, stat := range collectionStats.groups {
 			stat.LogSize = hrSize(stat.LogSizeBytes)
@@ -293,6 +295,7 @@ func (c *ComponentShow) JSONColumnsCommand(ctx context.Context, p *JSONColumnsPa
 			totalLogSizeBytes += stat.LogSizeBytes
 			totalMemoryBytes += stat.MemorySizeBytes
 			totalJSONStatsBytes += stat.JSONStatsMemoryBytes
+			totalV2RawBytes += stat.V2RawEstimateBytes
 			columns = append(columns, stat)
 		}
 	}
@@ -318,6 +321,7 @@ func (c *ComponentShow) JSONColumnsCommand(ctx context.Context, p *JSONColumnsPa
 		totalLogSizeBytes:   totalLogSizeBytes,
 		totalMemoryBytes:    totalMemoryBytes,
 		totalJSONStatsBytes: totalJSONStatsBytes,
+		totalV2RawBytes:     totalV2RawBytes,
 	}, framework.NameFormat(p.Format)), nil
 }
 
@@ -515,9 +519,13 @@ func (rs *JSONColumns) printAsTable() string {
 		}
 		t.AppendRow(row)
 	}
-	return fmt.Sprintf("%s\n--- JSON collections: %d collections, JSON columns: %d columns, storage groups: %d groups, matched segments: %d segments, matched rows: %d rows, insert log size: %s, mem size: %s, json stats size: %s\n",
-		t.Render(), rs.matchedCollections, rs.jsonColumnCount, len(rs.columns), rs.segmentCount, rs.segmentRows,
+	summary := fmt.Sprintf("--- JSON collections: %d collections, JSON columns: %d columns, storage groups: %d groups, matched segments: %d segments, matched rows: %d rows, insert log size: %s, mem size: %s, json stats size: %s",
+		rs.matchedCollections, rs.jsonColumnCount, len(rs.columns), rs.segmentCount, rs.segmentRows,
 		hrSize(rs.totalLogSizeBytes), hrSize(rs.totalMemoryBytes), hrSize(rs.totalJSONStatsBytes))
+	if rs.totalV2RawBytes > 0 {
+		summary += fmt.Sprintf(", v2 json estimate size: %s", hrSize(rs.totalV2RawBytes))
+	}
+	return fmt.Sprintf("%s\n%s\n", t.Render(), summary)
 }
 
 func (rs *JSONColumns) printAsLine() string {
@@ -530,9 +538,13 @@ func (rs *JSONColumns) printAsLine() string {
 		}
 		fmt.Fprintln(sb)
 	}
-	fmt.Fprintf(sb, "--- JSON collections: %d collections, JSON columns: %d columns, storage groups: %d groups, matched segments: %d segments, matched rows: %d rows, insert log size: %s, mem size: %s, json stats size: %s\n",
+	fmt.Fprintf(sb, "--- JSON collections: %d collections, JSON columns: %d columns, storage groups: %d groups, matched segments: %d segments, matched rows: %d rows, insert log size: %s, mem size: %s, json stats size: %s",
 		rs.matchedCollections, rs.jsonColumnCount, len(rs.columns), rs.segmentCount, rs.segmentRows,
 		hrSize(rs.totalLogSizeBytes), hrSize(rs.totalMemoryBytes), hrSize(rs.totalJSONStatsBytes))
+	if rs.totalV2RawBytes > 0 {
+		fmt.Fprintf(sb, ", v2 json estimate size: %s", hrSize(rs.totalV2RawBytes))
+	}
+	fmt.Fprintln(sb)
 	return sb.String()
 }
 
@@ -756,8 +768,8 @@ func applyV2JSONSample(stat *JSONColumnStat, collectionStats *jsonCollectionStat
 		if sample.totalBytes > 0 {
 			ratio = float64(sampleBytes) / float64(sample.totalBytes)
 		}
-		estimatedLogBytes := int64(math.Round(float64(stat.LogSizeBytes) * ratio))
-		estimatedMemoryBytes := int64(math.Round(float64(stat.MemorySizeBytes) * ratio))
+		estimatedLogBytes := rawEstimateBytes
+		estimatedMemoryBytes := rawEstimateBytes
 
 		fieldName := ""
 		if field := collectionStats.fields[fieldID]; field != nil {
@@ -803,11 +815,10 @@ func displayV2Estimates(col *JSONColumnStat) string {
 	var totalRawEstimateBytes int64
 	for _, estimate := range col.V2FieldEstimates {
 		totalRawEstimateBytes += estimate.RawEstimateBytes
-		parts = append(parts, fmt.Sprintf("%d avg=%.1fB raw~%s ratio=%.2f%% log~%s mem~%s",
+		parts = append(parts, fmt.Sprintf("%d avg=%.1fB raw~%s log~%s mem~%s",
 			estimate.FieldID,
 			estimate.SampleAvgBytes,
 			estimate.RawEstimate,
-			estimate.SampleRatio*100,
 			estimate.EstimatedLogSize,
 			estimate.EstimatedMemorySize,
 		))
@@ -829,8 +840,14 @@ func (rs *JSONColumns) printAsJSON() string {
 		TotalMemory         string            `json:"total_memory"`
 		TotalJSONStatsBytes int64             `json:"total_json_stats_bytes"`
 		TotalJSONStats      string            `json:"total_json_stats"`
+		TotalV2RawBytes     int64             `json:"total_v2_raw_estimate_bytes,omitempty"`
+		TotalV2Raw          string            `json:"total_v2_raw_estimate,omitempty"`
 	}
 
+	totalV2Raw := ""
+	if rs.totalV2RawBytes > 0 {
+		totalV2Raw = hrSize(rs.totalV2RawBytes)
+	}
 	return framework.MarshalJSON(OutputJSON{
 		Columns:             rs.columns,
 		JSONCollections:     rs.matchedCollections,
@@ -844,5 +861,7 @@ func (rs *JSONColumns) printAsJSON() string {
 		TotalMemory:         hrSize(rs.totalMemoryBytes),
 		TotalJSONStatsBytes: rs.totalJSONStatsBytes,
 		TotalJSONStats:      hrSize(rs.totalJSONStatsBytes),
+		TotalV2RawBytes:     rs.totalV2RawBytes,
+		TotalV2Raw:          totalV2Raw,
 	})
 }
