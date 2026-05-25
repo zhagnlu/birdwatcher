@@ -1,6 +1,7 @@
 package show
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/milvus-io/birdwatcher/models"
@@ -110,6 +111,9 @@ func TestApplyV2JSONSampleEstimatesRawAndAllocatedSizes(t *testing.T) {
 	if stat.V2SampleRows != 10 || stat.V2SampleBytes != 1000 {
 		t.Fatalf("unexpected sample summary: rows=%d bytes=%d", stat.V2SampleRows, stat.V2SampleBytes)
 	}
+	if stat.V2RawEstimateBytes != 10000 || stat.V2RawEstimate != "9.765625 KB" {
+		t.Fatalf("unexpected raw estimate summary: bytes=%d size=%s", stat.V2RawEstimateBytes, stat.V2RawEstimate)
+	}
 	if len(stat.V2FieldEstimates) != 2 {
 		t.Fatalf("expected 2 estimates, got %d", len(stat.V2FieldEstimates))
 	}
@@ -133,5 +137,9 @@ func TestApplyV2JSONSampleEstimatesRawAndAllocatedSizes(t *testing.T) {
 	}
 	if second.EstimatedLogSizeBytes != 750 || second.EstimatedMemorySizeBytes != 1500 {
 		t.Fatalf("second allocated sizes = log %d mem %d, want 750/1500", second.EstimatedLogSizeBytes, second.EstimatedMemorySizeBytes)
+	}
+
+	if got := displayV2Estimates(stat); !strings.Contains(got, "rows=10 raw_total~9.765625 KB;") {
+		t.Fatalf("displayV2Estimates() = %q, want raw_total summary", got)
 	}
 }

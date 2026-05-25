@@ -61,6 +61,8 @@ type JSONColumnStat struct {
 	JSONStatsMemory        string                       `json:"json_stats_memory"`
 	V2SampleRows           int64                        `json:"v2_sample_rows,omitempty"`
 	V2SampleBytes          int64                        `json:"v2_sample_bytes,omitempty"`
+	V2RawEstimateBytes     int64                        `json:"v2_raw_estimate_bytes,omitempty"`
+	V2RawEstimate          string                       `json:"v2_raw_estimate,omitempty"`
 	V2FieldEstimates       []*JSONColumnV2FieldEstimate `json:"v2_field_estimates,omitempty"`
 }
 
@@ -733,10 +735,12 @@ func applyV2JSONSample(stat *JSONColumnStat, collectionStats *jsonCollectionStat
 	stat.V2SampleRows = sample.rows
 	stat.V2SampleBytes = sample.totalBytes
 	stat.V2FieldEstimates = make([]*JSONColumnV2FieldEstimate, 0, len(stat.FieldIDs))
+	var totalRawEstimateBytes int64
 	for _, fieldID := range stat.FieldIDs {
 		sampleBytes := sample.fieldBytes[fieldID]
 		avgBytes := float64(sampleBytes) / float64(sample.rows)
 		rawEstimateBytes := int64(math.Round(avgBytes * float64(stat.RowCount)))
+		totalRawEstimateBytes += rawEstimateBytes
 		var ratio float64
 		if sample.totalBytes > 0 {
 			ratio = float64(sampleBytes) / float64(sample.totalBytes)
@@ -763,6 +767,8 @@ func applyV2JSONSample(stat *JSONColumnStat, collectionStats *jsonCollectionStat
 			EstimatedMemorySize:      hrSize(estimatedMemoryBytes),
 		})
 	}
+	stat.V2RawEstimateBytes = totalRawEstimateBytes
+	stat.V2RawEstimate = hrSize(totalRawEstimateBytes)
 }
 
 func jsonValueSize(value any) int64 {
@@ -783,7 +789,9 @@ func displayV2Estimates(col *JSONColumnStat) string {
 		return "-"
 	}
 	parts := make([]string, 0, len(col.V2FieldEstimates))
+	var totalRawEstimateBytes int64
 	for _, estimate := range col.V2FieldEstimates {
+		totalRawEstimateBytes += estimate.RawEstimateBytes
 		parts = append(parts, fmt.Sprintf("%d avg=%.1fB raw~%s ratio=%.2f%% log~%s mem~%s",
 			estimate.FieldID,
 			estimate.SampleAvgBytes,
@@ -793,7 +801,7 @@ func displayV2Estimates(col *JSONColumnStat) string {
 			estimate.EstimatedMemorySize,
 		))
 	}
-	return fmt.Sprintf("rows=%d; %s", col.V2SampleRows, strings.Join(parts, "; "))
+	return fmt.Sprintf("rows=%d raw_total~%s; %s", col.V2SampleRows, hrSize(totalRawEstimateBytes), strings.Join(parts, "; "))
 }
 
 func (rs *JSONColumns) printAsJSON() string {
