@@ -39,7 +39,7 @@ func TestEnsureJSONGroupStatMergesPackedFields(t *testing.T) {
 		groups: make(map[string]*JSONColumnStat),
 	}
 
-	stat := ensureJSONGroupStat(collectionStats, []int64{106, 105, 106})
+	stat := ensureJSONGroupStat(collectionStats, []int64{106, 105, 106}, true)
 	if stat.FieldID != 105 {
 		t.Fatalf("expected first field id 105, got %d", stat.FieldID)
 	}
@@ -58,17 +58,44 @@ func TestEnsureJSONGroupStatMergesPackedFields(t *testing.T) {
 }
 
 func TestJSONStorageMode(t *testing.T) {
-	if got := jsonStorageMode([]int64{105}); got != "v1" {
+	if got := jsonStorageMode(false); got != "v1" {
 		t.Fatalf("jsonStorageMode(single) = %s, want v1", got)
 	}
-	if got := jsonSizeScope([]int64{105}); got != "field" {
+	if got := jsonSizeScope(false); got != "field" {
 		t.Fatalf("jsonSizeScope(single) = %s, want field", got)
 	}
-	if got := jsonStorageMode([]int64{105, 106}); got != "v2" {
+	if got := jsonStorageMode(true); got != "v2" {
 		t.Fatalf("jsonStorageMode(packed) = %s, want v2", got)
 	}
-	if got := jsonSizeScope([]int64{105, 106}); got != "shared_group" {
+	if got := jsonSizeScope(true); got != "shared_group" {
 		t.Fatalf("jsonSizeScope(packed) = %s, want shared_group", got)
+	}
+}
+
+func TestEnsureJSONGroupStatSingleJSONFieldInPackedBinlog(t *testing.T) {
+	collectionStats := &jsonCollectionStats{
+		databaseID:      1,
+		databaseName:    "default",
+		collectionID:    100,
+		collectionName:  "posts",
+		collectionState: "CollectionCreated",
+		fields: map[int64]*schemapb.FieldSchema{
+			112: {FieldID: 112, Name: "$meta", DataType: schemapb.DataType_JSON},
+		},
+		groups: make(map[string]*JSONColumnStat),
+	}
+
+	stat := ensureJSONGroupStat(collectionStats, []int64{112}, true)
+	if stat.StorageMode != "v2" {
+		t.Fatalf("expected v2 storage mode, got %s", stat.StorageMode)
+	}
+	if stat.SizeScope != "shared_group" {
+		t.Fatalf("expected shared_group size scope, got %s", stat.SizeScope)
+	}
+
+	stat = ensureJSONGroupStat(collectionStats, []int64{112}, false)
+	if stat.StorageMode != "v2" || stat.SizeScope != "shared_group" {
+		t.Fatalf("packed storage metadata was downgraded: mode=%s scope=%s", stat.StorageMode, stat.SizeScope)
 	}
 }
 

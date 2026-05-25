@@ -201,6 +201,7 @@ func (c *ComponentShow) JSONColumnsCommand(ctx context.Context, p *JSONColumnsPa
 
 		segmentGroups := make(map[string]insertLogSummary)
 		segmentGroupFields := make(map[string][]int64)
+		segmentGroupPacked := make(map[string]bool)
 		fieldGroupKeys := make(map[int64]string)
 		for _, fieldBinlog := range seg.GetBinlogs() {
 			if fieldBinlog == nil {
@@ -215,6 +216,7 @@ func (c *ComponentShow) JSONColumnsCommand(ctx context.Context, p *JSONColumnsPa
 				mergeInsertLogSummary(&groupSummary, summary)
 				segmentGroups[key] = groupSummary
 				segmentGroupFields[key] = fieldIDs
+				segmentGroupPacked[key] = segmentGroupPacked[key] || isPackedFieldBinlog(fieldBinlog)
 				fieldGroupKeys[fieldBinlog.FieldID] = key
 			}
 
@@ -227,13 +229,14 @@ func (c *ComponentShow) JSONColumnsCommand(ctx context.Context, p *JSONColumnsPa
 			mergeInsertLogSummary(&groupSummary, summary)
 			segmentGroups[key] = groupSummary
 			segmentGroupFields[key] = childFieldIDs
+			segmentGroupPacked[key] = segmentGroupPacked[key] || isPackedFieldBinlog(fieldBinlog)
 			for _, fieldID := range childFieldIDs {
 				fieldGroupKeys[fieldID] = key
 			}
 		}
 
 		for key, summary := range segmentGroups {
-			stat := ensureJSONGroupStat(collectionStats, segmentGroupFields[key])
+			stat := ensureJSONGroupStat(collectionStats, segmentGroupFields[key], segmentGroupPacked[key])
 			stat.SegmentCount++
 			stat.SegmentRows += seg.GetNumOfRows()
 			stat.LogCount += summary.logCount
@@ -262,7 +265,7 @@ func (c *ComponentShow) JSONColumnsCommand(ctx context.Context, p *JSONColumnsPa
 			segmentJSONStats[key] = summary
 		}
 		for key, summary := range segmentJSONStats {
-			stat := ensureJSONGroupStat(collectionStats, segmentGroupFields[key])
+			stat := ensureJSONGroupStat(collectionStats, segmentGroupFields[key], false)
 			stat.JSONStatsBuiltSegments++
 			stat.JSONStatsFileCount += summary.fileCount
 			stat.JSONStatsMemoryBytes += summary.memoryBytes
@@ -339,10 +342,14 @@ func mergeInsertLogSummary(dst *insertLogSummary, src insertLogSummary) {
 	dst.memorySizeBytes += src.memorySizeBytes
 }
 
-func ensureJSONGroupStat(collectionStats *jsonCollectionStats, fieldIDs []int64) *JSONColumnStat {
+func ensureJSONGroupStat(collectionStats *jsonCollectionStats, fieldIDs []int64, packed bool) *JSONColumnStat {
 	fieldIDs = normalizeJSONFieldIDs(fieldIDs)
 	key := jsonFieldGroupKey(fieldIDs)
 	if stat, ok := collectionStats.groups[key]; ok {
+		if packed {
+			stat.StorageMode = jsonStorageMode(true)
+			stat.SizeScope = jsonSizeScope(true)
+		}
 		return stat
 	}
 
@@ -365,8 +372,8 @@ func ensureJSONGroupStat(collectionStats *jsonCollectionStats, fieldIDs []int64)
 		CollectionState: collectionStats.collectionState,
 		FieldIDs:        append([]int64(nil), fieldIDs...),
 		FieldNames:      fieldNames,
-		StorageMode:     jsonStorageMode(fieldIDs),
-		SizeScope:       jsonSizeScope(fieldIDs),
+		StorageMode:     jsonStorageMode(packed),
+		SizeScope:       jsonSizeScope(packed),
 		IsDynamic:       isDynamic,
 		LogSize:         hrSize(0),
 		MemorySize:      hrSize(0),
@@ -395,8 +402,12 @@ func ensureMissingJSONFieldRows(collectionStats *jsonCollectionStats) {
 		if _, ok := represented[fieldID]; ok {
 			continue
 		}
-		ensureJSONGroupStat(collectionStats, []int64{fieldID})
+		ensureJSONGroupStat(collectionStats, []int64{fieldID}, false)
 	}
+}
+
+func isPackedFieldBinlog(fieldBinlog *models.FieldBinlog) bool {
+	return fieldBinlog != nil && len(fieldBinlog.ChildFields) > 0
 }
 
 func packedJSONChildFieldIDs(
@@ -543,15 +554,15 @@ func displayJSONFieldIDs(col *JSONColumnStat) string {
 	return strings.Join(parts, ",")
 }
 
-func jsonStorageMode(fieldIDs []int64) string {
-	if len(fieldIDs) > 1 {
+func jsonStorageMode(packed bool) string {
+	if packed {
 		return "v2"
 	}
 	return "v1"
 }
 
-func jsonSizeScope(fieldIDs []int64) string {
-	if len(fieldIDs) > 1 {
+func jsonSizeScope(packed bool) string {
+	if packed {
 		return "shared_group"
 	}
 	return "field"
